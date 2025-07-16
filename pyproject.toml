@@ -1,0 +1,14 @@
+[project]
+name = "networktokenizers"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "datasets>=4.0.0",
+    "pydantic>=2.11.7",
+    "pytest>=8.4.1",
+    "scapy>=2.6.1",
+    "torch>=2.7.1",
+    "transformers>=4.53.2",
+    "xformers>=0.0.31.post1",
+]
