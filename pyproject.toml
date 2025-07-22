@@ -9,6 +9,8 @@ dependencies = [
     "pytest>=8.4.1",
     "scapy>=2.6.1",
     "torch>=2.7.1",
+    "tqdm>=4.67.1",
     "transformers>=4.53.2",
+    "wandb>=0.21.0",
     "xformers>=0.0.31.post1",
 ]

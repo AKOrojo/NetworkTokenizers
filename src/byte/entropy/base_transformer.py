@@ -201,6 +201,7 @@ def generate_doc_mask_mod(
     Args:
         mask_mod: The mask mod to apply to the documents
         lengths: Lengths of each document
+        kv_lengths: Lengths of each kv
 
     Note:
         What is the sequence stacked format? When assembling batches of inputs, we

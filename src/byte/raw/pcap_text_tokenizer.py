@@ -102,6 +102,15 @@ class PCAPTextTokenizer(PreTrainedTokenizer):
         vocab.update(self.added_tokens_encoder)
         return vocab
 
+
+    def get_vocab_size(self):
+        """
+        Returns the full vocabulary size, including special tokens.
+        This is equivalent to `len(tokenizer)`.
+        """
+        return self.vocab_size + len(self.added_tokens_encoder)
+
+
     @staticmethod
     def parse_pcap_file(pcap_path: Union[str, Path],
                         extract_payload: bool = False,
