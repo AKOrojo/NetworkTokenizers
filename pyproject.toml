@@ -8,6 +8,7 @@ dependencies = [
     "pydantic>=2.11.7",
     "pytest>=8.4.1",
     "scapy>=2.6.1",
+    "sentencepiece>=0.2.0",
     "torch>=2.7.1",
     "tqdm>=4.67.1",
     "transformers>=4.53.2",
