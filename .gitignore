@@ -4,3 +4,4 @@
 *.pkl
 /src/byte/entropy/wandb/
 *.pt
+run*
