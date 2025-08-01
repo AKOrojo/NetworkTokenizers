@@ -5,3 +5,4 @@
 /src/byte/entropy/wandb/
 *.pt
 run*
+word_run*
