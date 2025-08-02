@@ -18,7 +18,7 @@ import shutil
 import tempfile
 import time
 from pathlib import Path
-from typing import List, Any, Tuple
+from typing import List, Tuple
 
 from src.byte.raw.field_aware_pcap_byte_tokenizer import FieldAwarePCAPByteTokenizer, SeparatorConfig
 
@@ -442,8 +442,8 @@ def main():
     parser.add_argument(
         "--max-depth",
         type=int,
-        default=4,
-        help="Maximum protocol parsing depth (2=L2, 3=L3, 4=L4)"
+        default=5,
+        help="Maximum protocol parsing depth (2=L2, 3=L3, 4=L4, 5=L5+)"  # Updated help text
     )
 
     parser.add_argument(
@@ -494,6 +494,42 @@ def main():
         help="Enable verbose logging"
     )
 
+    parser.add_argument(
+        "--no-application-fields",
+        action="store_true",
+        help="Don't separate application layer fields"
+    )
+
+    parser.add_argument(
+        "--parse-http-headers",
+        action="store_true",
+        help="Parse individual HTTP headers"
+    )
+
+    parser.add_argument(
+        "--parse-dns-sections",
+        action="store_true",
+        help="Parse DNS questions and answers sections"
+    )
+
+    parser.add_argument(
+        "--parse-tls-records",
+        action="store_true",
+        help="Parse TLS record boundaries"
+    )
+
+    parser.add_argument(
+        "--parse-dhcp-options",
+        action="store_true",
+        help="Parse DHCP options"
+    )
+
+    parser.add_argument(
+        "--detailed-app-parsing",
+        action="store_true",
+        help="Enable detailed application layer field parsing"
+    )
+
     args = parser.parse_args()
 
     # Set logging level
@@ -516,7 +552,13 @@ def main():
         max_depth=args.max_depth,
         insert_ethernet_fields=not args.no_ethernet_fields,
         insert_ip_fields=not args.no_ip_fields,
-        insert_transport_fields=not args.no_transport_fields
+        insert_transport_fields=not args.no_transport_fields,
+        insert_application_fields=not args.no_application_fields,  # NEW
+        parse_http_headers=args.parse_http_headers,
+        parse_dns_sections=args.parse_dns_sections,
+        parse_tls_records=args.parse_tls_records,
+        parse_dhcp_options=args.parse_dhcp_options,
+        detailed_app_parsing=args.detailed_app_parsing
     )
 
     # Build corpus
