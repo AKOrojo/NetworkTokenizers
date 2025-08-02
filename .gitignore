@@ -7,4 +7,4 @@
 run*
 word_run*
 sentencepiece_corpus.*
-
+__pycache__
