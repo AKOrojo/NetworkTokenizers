@@ -10,7 +10,7 @@ import torch.distributed as dist
 from torch.utils.data import IterableDataset
 import torch
 
-from src.byte.raw.pcap_text_tokenizer import PCAPTextTokenizer
+from others.pcap_text_tokenizer import PCAPTextTokenizer
 
 
 class StreamingCorpusDataset(IterableDataset):

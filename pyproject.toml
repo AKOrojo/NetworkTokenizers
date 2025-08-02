@@ -5,14 +5,14 @@ description = "Add your description here"
 requires-python = ">=3.13"
 dependencies = [
     "datasets>=4.0.0",
+    "dpkt>=1.9.8",
     "psutil>=7.0.0",
     "pydantic>=2.11.7",
     "pytest>=8.4.1",
-    "scapy>=2.6.1",
-    "sentencepiece>=0.2.0",
+    #"sentencepiece>=0.2.0",
     "torch>=2.7.1",
     "tqdm>=4.67.1",
     "transformers>=4.53.2",
     "wandb>=0.21.0",
-    "xformers>=0.0.31.post1",
+    #"xformers>=0.0.31.post1",
 ]

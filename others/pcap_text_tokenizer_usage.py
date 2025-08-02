@@ -4,7 +4,7 @@ from scapy.all import wrpcap
 from scapy.layers.l2 import Ether
 from scapy.layers.inet import IP, TCP
 
-from src.byte.raw.pcap_text_tokenizer import PCAPTextTokenizer
+from others.pcap_text_tokenizer import PCAPTextTokenizer
 
 if __name__ == "__main__":
     # Initialize the tokenizer

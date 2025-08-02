@@ -3,7 +3,6 @@
 import argparse
 from pathlib import Path
 import sys
-import os
 import time
 import threading
 from tqdm import tqdm
@@ -14,7 +13,7 @@ import wandb
 import psutil
 
 # Directly import your custom tokenizer class
-from src.byte.raw.field_aware_tokenizer import PCAPFieldTokenizer
+from others.field_aware_tokenizer import PCAPFieldTokenizer
 
 # A global variable to hold the tokenizer instance within each worker process.
 tokenizer = None

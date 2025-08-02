@@ -5,7 +5,7 @@ A pure byte-level PCAP tokenizer with no special tokens.
 from pathlib import Path
 from typing import List, Union, Dict, Optional, Tuple
 
-from scapy.all import rdpcap
+import dpkt
 from transformers.tokenization_utils import PreTrainedTokenizer
 from transformers.utils import logging
 
@@ -23,6 +23,8 @@ class PCAPByteTokenizer(PreTrainedTokenizer):
     concatenates the raw bytes of all packets into a single sequence, and maps
     each byte to its integer value as the token ID.
 
+    Uses dpkt to read the original captured packet bytes without any parsing
+    or reconstruction artifacts.
     """
 
     model_input_names = ["input_ids", "attention_mask"]
@@ -35,16 +37,16 @@ class PCAPByteTokenizer(PreTrainedTokenizer):
         possible byte values (0-255). No special tokens are added.
         """
 
-        super().__init__(
-            pad_token=None,
-            eos_token=None,
-            unk_token=None,
-            bos_token=None,
-            sep_token=None,
-            cls_token=None,
-            mask_token=None,
-            **kwargs,
-        )
+        # Set default values for special tokens if not already provided
+        kwargs.setdefault('pad_token', None)
+        kwargs.setdefault('eos_token', None)
+        kwargs.setdefault('unk_token', None)
+        kwargs.setdefault('bos_token', None)
+        kwargs.setdefault('sep_token', None)
+        kwargs.setdefault('cls_token', None)
+        kwargs.setdefault('mask_token', None)
+
+        super().__init__(**kwargs)
 
     @property
     def vocab_size(self) -> int:
@@ -58,34 +60,77 @@ class PCAPByteTokenizer(PreTrainedTokenizer):
         Constructs the vocabulary dictionary on the fly. The tokens are represented as
         characters corresponding to their byte value.
         """
-        vocab = {self.convert_ids_to_tokens(i): i for i in range(self.vocab_size)}
+        vocab = {self._convert_id_to_token(i): i for i in range(self.vocab_size)}
         return vocab
+
+    def tokenize_pcap(self, pcap_path: Union[str, Path]) -> List[str]:
+        """
+        Public method to tokenize a PCAP file.
+
+        Args:
+            pcap_path: Path to the PCAP file to tokenize
+
+        Returns:
+            List of single-character tokens representing each byte
+        """
+        return self._tokenize(str(pcap_path))
+
+    def read_pcap_bytes(self, pcap_path: Union[str, Path]) -> bytes:
+        """
+        Public method to read raw bytes from a PCAP file.
+
+        Args:
+            pcap_path: Path to the PCAP file to read
+
+        Returns:
+            Raw bytes from all packets in the PCAP file
+        """
+        return self._read_pcap_bytes(pcap_path)
+
+    def tokenize_pcap_to_ids(self, pcap_path: Union[str, Path]) -> List[int]:
+        """
+        Public method to tokenize a PCAP file directly to token IDs.
+
+        Args:
+            pcap_path: Path to the PCAP file to tokenize
+
+        Returns:
+            List of token IDs (integers 0-255)
+        """
+        tokens = self.tokenize_pcap(pcap_path)
+        return [self._convert_token_to_id(token) for token in tokens]
 
     @staticmethod
     def _read_pcap_bytes(pcap_path: Union[str, Path]) -> bytes:
         """
         Reads a PCAP file and returns the concatenated raw bytes of all packets.
 
+        Uses dpkt to read the original captured packet bytes directly from the PCAP file
+        without any parsing or reconstruction. This preserves the exact bytes that were
+        captured on the wire.
+
         Args:
             pcap_path: The path to the PCAP file.
 
         Returns:
-            A single bytes object containing all packet data from the file.
+            A single bytes object containing all raw packet data from the file.
 
         Raises:
             FileNotFoundError: If the PCAP file does not exist.
-            ValueError: If there is an error parsing the PCAP file with Scapy.
+            ValueError: If there is an error reading the PCAP file.
         """
         pcap_path = Path(pcap_path)
         if not pcap_path.is_file():
             raise FileNotFoundError(f"PCAP file not found at: {pcap_path}")
 
         try:
-            packets = rdpcap(str(pcap_path))
-            all_bytes = b"".join(bytes(p) for p in packets)
+            with open(pcap_path, 'rb') as f:
+                pcap = dpkt.pcap.Reader(f)
+                # buf contains the raw packet bytes as captured on the wire
+                all_bytes = b"".join(buf for ts, buf in pcap)
             return all_bytes
         except Exception as e:
-            raise ValueError(f"Error parsing PCAP file {pcap_path}: {e}")
+            raise ValueError(f"Error reading PCAP file {pcap_path}: {e}")
 
     def _tokenize(self, text: str, **kwargs) -> List[str]:
         """
@@ -169,8 +214,7 @@ class PCAPByteTokenizer(PreTrainedTokenizer):
             return [0] * len(token_ids_0)
         return [0] * (len(token_ids_0) + len(token_ids_1))
 
-    @staticmethod
-    def save_vocabulary(**kwargs) -> Tuple:
+    def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple:
         """
         This tokenizer has a fixed, algorithmically-defined vocabulary and does
         not save a vocabulary file.

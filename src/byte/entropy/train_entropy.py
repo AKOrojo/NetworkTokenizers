@@ -26,7 +26,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import GradScaler, autocast
 
 from src.byte.entropy.corpus_utils import TokenizerCollate, StreamingCorpusDataset
-from src.byte.raw.pcap_text_tokenizer import PCAPTextTokenizer
+from others.pcap_text_tokenizer import PCAPTextTokenizer
 from src.byte.entropy.transformer import LMTransformer, LMTransformerArgs
 
 
