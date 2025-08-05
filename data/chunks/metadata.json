@@ -1,0 +1,43 @@
+{
+  "tokenizer_config": {
+    "vocab_size": 261,
+    "pad_token_id": 0,
+    "unk_token_id": 1,
+    "eos_token_id": 2,
+    "bos_token_id": 3,
+    "pkt_token_id": 4
+  },
+  "dataset_config": {
+    "chunk_size": 16777216,
+    "add_packet_separators": true,
+    "output_format": "pickle",
+    "max_file_size_gb": 10.0,
+    "num_processes": 2
+  },
+  "source_files": [
+    {
+      "file_path": "data/test.pcap",
+      "file_size_bytes": 64984,
+      "num_tokens": 62844,
+      "chunk_start_idx": 0,
+      "num_chunks": 1
+    }
+  ],
+  "chunks": [
+    {
+      "chunk_idx": 0,
+      "filename": "chunk_00000000.pkl",
+      "source_file": "data/test.pcap",
+      "num_tokens": 62844
+    }
+  ],
+  "total_chunks": 1,
+  "total_tokens": 62844,
+  "processing_stats": {
+    "successful_files": 1,
+    "failed_files": 0,
+    "start_time": 1754355504.291856,
+    "end_time": 1754355507.6292613,
+    "total_time": 3.3374054431915283
+  }
+}

@@ -25,8 +25,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 # --- Import for Mixed Precision ---
 from torch.amp import GradScaler, autocast
 
-from src.byte.entropy.corpus_utils import TokenizerCollate, StreamingCorpusDataset
-from others.pcap_text_tokenizer import PCAPTextTokenizer
+# --- UPDATED IMPORTS FOR PRETOKENIZED DATA ---
+from src.preprocess.pretokenize_pcap_entropy import PreTokenizedPCAPDataset, PreTokenizedCollate
+from src.byte.raw.token_pcap_byte_tokenizer import TokenPCAPByteTokenizer
 from src.byte.entropy.transformer import LMTransformer, LMTransformerArgs
 
 
@@ -44,45 +45,56 @@ def cleanup_distributed():
     """Cleans up the distributed environment."""
     dist.destroy_process_group()
 
-def create_batched_stream(data_streamer, batch_size: int):
-    """Wraps a data streamer to yield batches of a specified size."""
-    while True:
-        batch = list(islice(data_streamer, batch_size))
-        if not batch:
-            break
-        yield batch
+
+def dist_mean(tensor):
+    """Calculate mean across all processes."""
+    if dist.is_initialized():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        tensor /= dist.get_world_size()
+    return tensor
 
 
-def collate_and_pad_batch(batch: List[List[int]], pad_id: int, max_len: int) -> torch.Tensor:
-    """Pads sequences in a batch to the max sequence length."""
-    padded_batch = []
-    for seq in batch:
-        truncated_seq = seq[:max_len]
-        padded_seq = truncated_seq + [pad_id] * (max_len - len(truncated_seq))
-        padded_batch.append(padded_seq)
-    return torch.tensor(padded_batch, dtype=torch.long)
+def dist_sum(tensor, reduce_dtype=None):
+    """Calculate sum across all processes."""
+    if dist.is_initialized():
+        if reduce_dtype is not None:
+            original_dtype = tensor.dtype
+            tensor = tensor.to(reduce_dtype)
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        if reduce_dtype is not None:
+            tensor = tensor.to(original_dtype)
+    return tensor
 
 
-def create_entropy_model(tokenizer: PCAPTextTokenizer) -> (LMTransformer, LMTransformerArgs):
-    """Creates an instance of the LMTransformer with specs for a ~10M parameter model."""
-    effective_vocab_size = len(tokenizer.get_vocab())
+def create_entropy_model(tokenizer: TokenPCAPByteTokenizer, rank: int) -> (LMTransformer, LMTransformerArgs):
+    """Creates an instance of the LMTransformer following BLT's architecture."""
+    effective_vocab_size = tokenizer.vocab_size
 
+    # BLT-matched architecture
     model_args = LMTransformerArgs(
-        dim=512,
-        n_layers=3,
-        n_heads=8,
+        dim=768,
+        n_layers=14,
+        n_heads=12,
         vocab_size=effective_vocab_size,
-        max_seqlen=2048,
-        sliding_window=1024,
+        max_seqlen=8192,
+        sliding_window=512,
+        ffn_dim_multiplier=1.0,
+        attn_bias_type="local_block_causal",
         attn_impl="xformers"
     )
 
-    if dist.get_rank() == 0:
-        print("Initializing entropy model with args:")
+    if rank == 0:
+        print("Initializing transformer model with args:")
         print(model_args)
 
     model = LMTransformer(model_args)
     model.init_weights()
+    
+    # Calculate actual parameter count
+    total_params = sum(p.numel() for p in model.parameters())
+    if rank == 0:
+        print(f"Model has {total_params:,} parameters ({total_params/1e6:.1f}M)")
+    
     return model, model_args
 
 
@@ -99,23 +111,84 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_ratio):
     return LambdaLR(optimizer, lr_lambda)
 
 
+def evaluate_model_blt_style(model, eval_loader, device, rank, world_size):
+    """Evaluate entropy model with BLT-style metrics"""
+    model.eval()
+    total_loss = 0.0
+    total_bytes = 0
+    
+    with torch.no_grad():
+        for batch in eval_loader:
+            batch = batch.to(device, non_blocking=True)
+            
+            # Handle chunks longer than max_seqlen
+            if batch.size(1) > 8192:
+                batch = batch[:, :8192]
+            
+            input_tensor = batch[:, :-1]
+            target_tensor = batch[:, 1:]
+            
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = model(token_values=input_tensor, target=target_tensor)
+            
+            total_loss += loss.item() * target_tensor.numel()
+            total_bytes += target_tensor.numel()  # For byte-level: tokens = bytes
+    
+    # Local metrics
+    local_avg_loss = total_loss / total_bytes
+    local_bpb = local_avg_loss / math.log(2)
+    local_perplexity = math.exp(local_avg_loss)
+    
+    # Global metrics (aggregated across processes)
+    if world_size > 1:
+        global_total_loss = dist_sum(torch.tensor(total_loss, device=device))
+        global_total_bytes = dist_sum(torch.tensor(total_bytes, device=device))
+        global_avg_loss = global_total_loss / global_total_bytes
+        global_bpb = global_avg_loss / math.log(2)
+        global_perplexity = torch.exp(global_avg_loss)
+        
+        # Convert to Python numbers
+        global_avg_loss = global_avg_loss.item()
+        global_bpb = global_bpb.item()
+        global_perplexity = global_perplexity.item()
+    else:
+        global_avg_loss = local_avg_loss
+        global_bpb = local_bpb
+        global_perplexity = local_perplexity
+    
+    if rank == 0:
+        print(f"Evaluation Results:")
+        print(f"  Local - Loss: {local_avg_loss:.4f}, BPB: {local_bpb:.4f}, PPL: {local_perplexity:.2f}")
+        print(f"  Global - Loss: {global_avg_loss:.4f}, BPB: {global_bpb:.4f}, PPL: {global_perplexity:.2f}")
+    
+    return {
+        'eval_loss_local': local_avg_loss,
+        'eval_loss_global': global_avg_loss,
+        'bpb_local': local_bpb,
+        'bpb_global': global_bpb,
+        'perplexity_local': local_perplexity,
+        'perplexity_global': global_perplexity,
+    }
+
+
 def train_entropy_model(
         model: DDP,
-        data_streamer: DataLoader,
+        data_loader: DataLoader,
         config: dict,
         rank: int,
         local_rank: int,
+        world_size: int,
         start_step: int,
         optimizer: AdamW,
         scheduler: LambdaLR
 ):
-    """A simple training loop with advanced optimizer, scheduler, and checkpointing."""
+    """Training loop optimized for pretokenized data and H200."""
     device = torch.device(f"cuda:{local_rank}")
     model.train()
     scaler = GradScaler()
 
     # Create an iterator from the DataLoader to manually control steps
-    data_iterator = iter(data_streamer)
+    data_iterator = iter(data_loader)
 
     progress_bar = tqdm(
         range(start_step, config['training_steps']),
@@ -127,52 +200,103 @@ def train_entropy_model(
 
     for step in progress_bar:
         try:
-            # if step % 100 == 0:
-            #     dist.barrier()
-
             accumulated_loss = 0.0
+            
             # Gradient accumulation loop
-            for _ in range(config['gradient_accumulation_steps']):
+            for micro_step in range(config['gradient_accumulation_steps']):
                 try:
-                    # Get the already-padded tensor batch from the DataLoader
-                    padded_batch = next(data_iterator)
+                    # Get pretokenized batch (already padded)
+                    batch = next(data_iterator)
                 except StopIteration:
-                    # Dataloader is exhausted, reset it
-                    if rank == 0: print("\nData streamer is exhausted. Resetting.")
-                    data_iterator = iter(data_streamer)
-                    padded_batch = next(data_iterator)
+                    # DataLoader exhausted, reset it
+                    if rank == 0: 
+                        print(f"\nDataLoader exhausted at step {step}, micro_step {micro_step}. Resetting.")
+                    data_iterator = iter(data_loader)
+                    batch = next(data_iterator)
 
-                # Move batch to device and check if it's empty (from a failed collate)
-                padded_batch = padded_batch.to(device)
-                # if padded_batch.numel() == 0:
-                #     if rank == 0: print("Skipping empty batch.")
-                #     continue
+                # Move to device
+                batch = batch.to(device, non_blocking=True)
+                
+                # Handle chunks that are longer than model's max_seqlen
+                if batch.size(1) > config['max_seqlen']:
+                    # Randomly sample a window from the chunk for variety
+                    start_idx = torch.randint(0, batch.size(1) - config['max_seqlen'] + 1, (1,)).item()
+                    batch = batch[:, start_idx:start_idx + config['max_seqlen']]
+                
+                # Create input and target tensors
+                input_tensor = batch[:, :-1]
+                target_tensor = batch[:, 1:]
 
-                # The batch is already padded, directly create input and target
-                input_tensor = padded_batch[:, :-1]
-                target_tensor = padded_batch[:, 1:]
-
-                with autocast(device_type="cuda"):
+                with autocast(device_type="cuda", dtype=torch.bfloat16):
                     loss = model(token_values=input_tensor, target=target_tensor)
                     loss = loss / config['gradient_accumulation_steps']
 
                 accumulated_loss += loss.item()
                 scaler.scale(loss).backward()
 
-            # Unscale, step, and update after accumulating gradients
+            # Gradient clipping and optimizer step
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), config['gradient_clip_norm'])
             scaler.step(optimizer)
             scaler.update()
 
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
+            # Logging, evaluation, and checkpointing
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0]
-                wandb.log({"loss": accumulated_loss, "learning_rate": current_lr, "step": step})
-                progress_bar.set_postfix(loss=f"{accumulated_loss:.4f}", lr=f"{current_lr:.2e}")
+                
+                # Log training metrics
+                wandb.log({
+                    "train_loss": accumulated_loss, 
+                    "learning_rate": current_lr, 
+                    "step": step,
+                    "tokens_processed": (step + 1) * config['effective_batch_tokens']
+                })
+                
+                progress_bar.set_postfix(
+                    loss=f"{accumulated_loss:.4f}", 
+                    lr=f"{current_lr:.2e}",
+                    tokens=f"{(step + 1) * config['effective_batch_tokens'] / 1e6:.1f}M"
+                )
 
+                # Evaluation every eval_freq steps
+                if (step + 1) % config['eval_freq'] == 0:
+                    print(f"\nRunning evaluation at step {step + 1}...")
+                    
+                    # Create small eval subset from training data
+                    # In production, you should use separate validation chunks
+                    eval_subset = torch.utils.data.Subset(
+                        data_loader.dataset, 
+                        indices=list(range(0, min(1000, len(data_loader.dataset))))
+                    )
+                    eval_loader = torch.utils.data.DataLoader(
+                        eval_subset, 
+                        batch_size=config['batch_size_per_gpu'], 
+                        shuffle=False, 
+                        num_workers=2, 
+                        collate_fn=data_loader.collate_fn
+                    )
+                    
+                    eval_metrics = evaluate_model_blt_style(
+                        model, eval_loader, device, rank, world_size
+                    )
+                    
+                    # Log evaluation metrics
+                    wandb.log({
+                        "eval_loss_local": eval_metrics['eval_loss_local'],
+                        "eval_loss_global": eval_metrics['eval_loss_global'],
+                        "eval_bpb_local": eval_metrics['bpb_local'], 
+                        "eval_bpb_global": eval_metrics['bpb_global'],
+                        "eval_perplexity_local": eval_metrics['perplexity_local'],
+                        "eval_perplexity_global": eval_metrics['perplexity_global'],
+                        "step": step
+                    })
+                    
+                    model.train()  # Back to training mode
+
+                # Checkpointing
                 if (step + 1) % config['checkpoint_freq'] == 0:
                     checkpoint_path = Path(config['checkpoint_dir']) / f"checkpoint_step_{step + 1}.pt"
                     torch.save({
@@ -180,15 +304,14 @@ def train_entropy_model(
                         'model_state_dict': model.module.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
                         'scheduler_state_dict': scheduler.state_dict(),
-                        'scaler_state_dict': scaler.state_dict()
+                        'scaler_state_dict': scaler.state_dict(),
+                        'config': config
                     }, checkpoint_path)
                     print(f"\nSaved checkpoint to {checkpoint_path}")
 
-        except StopIteration:
-            if rank == 0: print("Data streamer finished early.")
-            break
         except Exception as e:
-            if rank == 0: print(f"Error at step {step}: {e}. Skipping.")
+            if rank == 0: 
+                print(f"Error at step {step}: {e}. Skipping.")
             continue
 
     if rank == 0:
@@ -196,30 +319,66 @@ def train_entropy_model(
 
 
 if __name__ == "__main__":
+    # Initialize distributed training (even for single GPU)
     rank, world_size, local_rank = setup_distributed()
 
+    # OPTIMIZED CONFIG MATCHING BLT'S DATA EFFICIENCY APPROACH
     train_config = {
-        "pcap_directory": "/home/abanisenioluwa_oroj1/Downloads/flows",
-        "pcap_data_ratio": 1.0,
-        "training_steps": 100000,
-        "learning_rate": 4e-4,
-        "warmup_steps": 500,
-        "batch_size_per_gpu": 64,
-        "gradient_accumulation_steps": 12,
-        "checkpoint_freq": 500,
-        "checkpoint_dir": "checkpoints"
+        # Data paths
+        "tokenized_dir": "/data/orojoa/chunks",
+        
+        # Training hyperparameters (BLT-style data efficiency)
+        "training_steps": 5000,
+        "learning_rate": 2e-4,                   # BLT's proven LR
+        "warmup_steps": 100,                     # BLT's warmup
+        "batch_size_per_gpu": 4,
+        "gradient_accumulation_steps": 49,       # 4 * 49 * 8192 = 1,605,632 tokens
+        "max_seqlen": 8192,
+        "gradient_clip_norm": 10.0,              # BLT's setting
+        "eval_freq": 250,                        # Evaluate every 500 steps
+        
+        # Checkpointing
+        "checkpoint_freq": 250,                  # Every 250 steps
+        "checkpoint_dir": "checkpoints",
     }
 
+    # Calculate effective batch size in tokens
+    train_config['effective_batch_tokens'] = (
+        train_config['batch_size_per_gpu'] * 
+        train_config['gradient_accumulation_steps'] * 
+        train_config['max_seqlen'] * 
+        world_size
+    )
+
     if rank == 0:
+        print(f"Training Configuration (BLT-Matched):")
+        print(f"  Tokenized data directory: {train_config['tokenized_dir']}")
+        print(f"  Training steps: {train_config['training_steps']:,}")
+        print(f"  Learning rate: {train_config['learning_rate']} (BLT-matched)")
+        print(f"  Warmup steps: {train_config['warmup_steps']} (BLT-matched)")
+        print(f"  Gradient clip: {train_config['gradient_clip_norm']} (BLT-matched)")
+        print(f"  Mixed precision: bfloat16")
+        print(f"  Evaluation frequency: every {train_config['eval_freq']} steps")
+        print(f"  Batch size per GPU: {train_config['batch_size_per_gpu']}")
+        print(f"  Gradient accumulation steps: {train_config['gradient_accumulation_steps']}")
+        print(f"  Effective batch size: {train_config['effective_batch_tokens']:,} tokens ({train_config['effective_batch_tokens']/1e6:.2f}M)")
+        print(f"  Max sequence length: {train_config['max_seqlen']}")
+        print(f"  Model: 768d, 14L, 12H (~130M params)")
+        print(f"  Total tokens: {train_config['training_steps'] * train_config['effective_batch_tokens'] / 1e9:.1f}B")
+        print(f"  World size: {world_size}")
+        
         Path(train_config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
 
-    pcap_tokenizer = PCAPTextTokenizer()
+    # Initialize tokenizer (for vocab size)
+    tokenizer = TokenPCAPByteTokenizer()
 
-    entropy_model, model_args = create_entropy_model(pcap_tokenizer)
+    # Create model
+    entropy_model, model_args = create_entropy_model(tokenizer, rank)
     entropy_model = torch.compile(entropy_model)
     entropy_model.to(local_rank)
     ddp_model = DDP(entropy_model, device_ids=[local_rank], find_unused_parameters=False)
 
+    # Initialize optimizer
     optimizer = AdamW(
         ddp_model.parameters(),
         lr=train_config['learning_rate'],
@@ -228,6 +387,7 @@ if __name__ == "__main__":
         eps=1e-8
     )
 
+    # Initialize scheduler
     scheduler = get_lr_scheduler(
         optimizer,
         warmup_steps=train_config['warmup_steps'],
@@ -235,31 +395,40 @@ if __name__ == "__main__":
         min_ratio=0.1
     )
 
-    # --- NEW DATA PIPELINE ---
-    NUM_WORKERS = 2
+    # --- PRETOKENIZED DATA PIPELINE ---
+    if rank == 0:
+        print("Setting up pretokenized data pipeline...")
 
-    # 1. Instantiate your custom dataset
-    streaming_dataset = StreamingCorpusDataset(
-        pcap_dir=train_config['pcap_directory'],
-        pcap_ratio=train_config['pcap_data_ratio']
+    # Load pretokenized dataset
+    dataset = PreTokenizedPCAPDataset(
+        tokenized_dir=train_config['tokenized_dir'],
+        max_length=None,  # Don't truncate here, handle in training loop
+        pad_token_id=tokenizer.pad_token_id
     )
 
-    # 2. Instantiate your custom collate function
-    tokenizer_collate_fn = TokenizerCollate(
-        tokenizer=pcap_tokenizer,
-        max_len=model_args.max_seqlen
+    # Create collate function for pretokenized data
+    collate_fn = PreTokenizedCollate(
+        pad_token_id=tokenizer.pad_token_id,
+        max_length=None  # Handle in training loop for random windowing
     )
 
-    # 3. Create the DataLoader
+    # Create DataLoader with optimized settings
     train_loader = DataLoader(
-        streaming_dataset,
+        dataset,
         batch_size=train_config['batch_size_per_gpu'],
-        num_workers=NUM_WORKERS,
-        collate_fn=tokenizer_collate_fn,
+        shuffle=True,
+        num_workers=4,
+        collate_fn=collate_fn,
         pin_memory=True,
-        prefetch_factor=2
+        persistent_workers=True,
+        prefetch_factor=8
     )
 
+    if rank == 0:
+        print(f"Dataset loaded: {len(dataset):,} chunks")
+        print(f"DataLoader created with {len(train_loader):,} batches per epoch")
+
+    # Load checkpoint if exists
     start_step = 0
     checkpoint_dir = Path(train_config['checkpoint_dir'])
     if checkpoint_dir.exists():
@@ -269,7 +438,7 @@ if __name__ == "__main__":
             if rank == 0:
                 print(f"Resuming training from checkpoint: {latest_checkpoint_path}")
             checkpoint = torch.load(latest_checkpoint_path, map_location=f"cuda:{local_rank}")
-            ddp_model.module.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            ddp_model.module.load_state_dict(checkpoint['model_state_dict'])
             optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
             start_step = checkpoint['step']
@@ -277,34 +446,45 @@ if __name__ == "__main__":
                 scaler = GradScaler()
                 scaler.load_state_dict(checkpoint['scaler_state_dict'])
 
+    # Initialize wandb
     if rank == 0:
-        project_name = "blt_entropy_model_pcap_text"
-        run_name = f"entropy-run-full-config-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
-        global_batch_size_bytes = (
-                train_config['batch_size_per_gpu'] * model_args.max_seqlen * world_size * train_config[
-            'gradient_accumulation_steps']
-        )
+        project_name = "pcap_entropy_model_blt_matched"
+        run_name = f"h200-blt-1.6m-tokens-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        
         wandb_config = train_config.copy()
-        wandb_config["global_batch_size_bytes"] = global_batch_size_bytes
-        wandb_config["world_size"] = world_size
         wandb_config["model_args"] = model_args.model_dump()
-        wandb.init(project=project_name, name=run_name, config=wandb_config, resume="allow", id=run_name)
+        wandb_config["world_size"] = world_size
+        wandb_config["dataset_size"] = len(dataset)
+        
+        wandb.init(
+            project=project_name, 
+            name=run_name, 
+            config=wandb_config, 
+            resume="allow", 
+            id=run_name
+        )
 
-
+    # Start training
+    if rank == 0:
+        print("Starting training...")
+        
     train_entropy_model(
         model=ddp_model,
-        data_streamer=train_loader,
+        data_loader=train_loader,
         config=train_config,
         rank=rank,
         local_rank=local_rank,
+        world_size=world_size,
         start_step=start_step,
         optimizer=optimizer,
         scheduler=scheduler
     )
 
+    # Save final model
     if rank == 0:
-        torch.save(ddp_model.module.state_dict(), "entropy_model_trained.pt")
-        print("Trained entropy model saved to entropy_model_trained.pt")
+        final_model_path = "pcap_entropy_model_final.pt"
+        torch.save(ddp_model.module.state_dict(), final_model_path)
+        print(f"Final model saved to {final_model_path}")
         wandb.finish()
 
     cleanup_distributed()
