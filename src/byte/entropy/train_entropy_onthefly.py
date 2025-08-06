@@ -96,6 +96,7 @@ def get_lr_scheduler(optimizer, warmup_steps, total_steps, min_ratio):
     return LambdaLR(optimizer, lr_lambda)
 
 
+# This is the correct, final version for your train_entropy_onthefly.py script
 def train_entropy_model(
         model: DDP,
         data_streamer: DataLoader,
@@ -110,11 +111,7 @@ def train_entropy_model(
     device = torch.device(f"cuda:{local_rank}")
     model.train()
     scaler = GradScaler()
-
-    # Create an iterator from the DataLoader to manually control steps
     data_iterator = iter(data_streamer)
-
-
 
     progress_bar = tqdm(
         range(start_step, config['training_steps']),
@@ -126,28 +123,17 @@ def train_entropy_model(
 
     for step in progress_bar:
         try:
-            if step % 100 == 0:
-                dist.barrier()
-
+            # --- TRAINING STEP LOGIC (Your existing code is correct) ---
             accumulated_loss = 0.0
-            # Gradient accumulation loop
             for _ in range(config['gradient_accumulation_steps']):
                 try:
-                    # Get the already-padded tensor batch from the DataLoader
                     padded_batch = next(data_iterator)
                 except StopIteration:
-                    # Dataloader is exhausted, reset it
                     if rank == 0: print("\nData streamer is exhausted. Resetting.")
                     data_iterator = iter(data_streamer)
                     padded_batch = next(data_iterator)
 
-                # Move batch to device and check if it's empty (from a failed collate)
                 padded_batch = padded_batch.to(device)
-                # if padded_batch.numel() == 0:
-                #     if rank == 0: print("Skipping empty batch.")
-                #     continue
-
-                # The batch is already padded, directly create input and target
                 input_tensor = padded_batch[:, :-1]
                 target_tensor = padded_batch[:, 1:]
 
@@ -158,21 +144,26 @@ def train_entropy_model(
                 accumulated_loss += loss.item()
                 scaler.scale(loss).backward()
 
-            # Unscale, step, and update after accumulating gradients
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optimizer)
             scaler.update()
-
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+            # --- END OF TRAINING STEP ---
 
+            # --- LOGGING, CHECKPOINTING, AND EVALUATION ---
+
+            # 1. Log training loss (only on rank 0)
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0]
                 wandb.log({"loss": accumulated_loss, "learning_rate": current_lr, "step": step})
                 progress_bar.set_postfix(loss=f"{accumulated_loss:.4f}", lr=f"{current_lr:.2e}")
 
-                if (step + 1) % config['checkpoint_freq'] == 0:
+            # 2. Check frequency for checkpoint/eval (on ALL ranks)
+            if (step + 1) % config['checkpoint_freq'] == 0:
+                # Save checkpoint (only on rank 0)
+                if rank == 0:
                     checkpoint_path = Path(config['checkpoint_dir']) / f"checkpoint_step_{step + 1}.pt"
                     torch.save({
                         'step': step + 1,
@@ -183,6 +174,47 @@ def train_entropy_model(
                     }, checkpoint_path)
                     print(f"\nSaved checkpoint to {checkpoint_path}")
 
+                # Synchronize all processes before evaluation
+                dist.barrier()
+
+                # Run evaluation loop on ALL ranks
+                model.eval()
+                total_eval_loss = 0
+                eval_iterator = iter(data_streamer)
+                with torch.no_grad():
+                    eval_steps = 50
+                    for _ in range(eval_steps):
+                        try:
+                            eval_batch = next(eval_iterator).to(device)
+                            if eval_batch.numel() == 0: continue
+
+                            input_tensor = eval_batch[:, :-1]
+                            target_tensor = eval_batch[:, 1:]
+
+                            with autocast(device_type="cuda"):
+                                eval_loss = model(token_values=input_tensor, target=target_tensor)
+                            total_eval_loss += eval_loss.item()
+                        except StopIteration:
+                            break
+
+                # Aggregate results from ALL ranks
+                total_eval_loss_tensor = torch.tensor(total_eval_loss, device=device)
+                dist.all_reduce(total_eval_loss_tensor, op=dist.ReduceOp.SUM)
+
+                # Calculate BPB and log (only on rank 0)
+                if rank == 0:
+                    world_size = dist.get_world_size()
+                    avg_loss = total_eval_loss_tensor.item() / (world_size * eval_steps)
+                    bpb = avg_loss / math.log(2)
+
+                    print(f"\n--- Evaluation at Step {step + 1} ---")
+                    print(f"Eval Loss: {avg_loss:.4f}, Eval BPB: {bpb:.4f}")
+                    wandb.log({"eval_loss": avg_loss, "eval_bpb": bpb, "step": step + 1})
+
+                # Switch back to training mode and synchronize
+                model.train()
+                dist.barrier()
+
         except StopIteration:
             if rank == 0: print("Data streamer finished early.")
             break
@@ -192,6 +224,8 @@ def train_entropy_model(
 
     if rank == 0:
         print("Training finished.")
+
+
 
 
 if __name__ == "__main__":
