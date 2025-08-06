@@ -135,6 +135,12 @@ class TokenizerCollate:
                 if tokens:
                     token_ids = self.tokenizer.convert_tokens_to_ids(tokens)
 
+                    # Validate token IDs are in valid range
+                    if any(tid < 0 or tid >= self.tokenizer.vocab_size for tid in token_ids):
+                        print(
+                            f"Warning: Invalid token IDs found: {[tid for tid in token_ids if tid < 0 or tid >= self.tokenizer.vocab_size]}")
+                        token_ids = [tid for tid in token_ids if 0 <= tid < self.tokenizer.vocab_size]
+
             except Exception as e:
                 problematic_source = sample.get("data", "Unknown source")
                 print(

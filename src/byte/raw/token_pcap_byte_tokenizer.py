@@ -269,6 +269,10 @@ class TokenPCAPByteTokenizer(PreTrainedTokenizer):
         # Return UNK token ID for unknown tokens
         return self._unk_id
 
+    def convert_tokens_to_ids(self, tokens: List[str]) -> List[int]:
+        """Convert tokens to IDs, handling our custom token mapping."""
+        return [self._convert_token_to_id(token) for token in tokens]
+
     def _convert_id_to_token(self, index: int) -> str:
         """
         Converts an ID to its token, handling special tokens and byte tokens with offset.

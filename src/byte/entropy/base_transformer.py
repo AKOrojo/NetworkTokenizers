@@ -16,7 +16,7 @@ from torch.nn.attention.flex_attention import (
 )
 from xformers.ops import AttentionBias, fmha
 
-EOS_ID = 1
+EOS_ID = 2
 
 logger = logging.getLogger()
 

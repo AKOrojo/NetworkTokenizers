@@ -253,6 +253,12 @@ if __name__ == "__main__":
     entropy_model, model_args = create_entropy_model(pcap_tokenizer)
     #entropy_model = torch.compile(entropy_model)
     entropy_model.to(local_rank)
+
+    if rank == 0:
+        print(f"Tokenizer EOS ID: {pcap_tokenizer.eos_token_id}")
+        print(f"Model EOS ID: {model_args.eos_id}")
+        assert pcap_tokenizer.eos_token_id == model_args.eos_id, "EOS token ID mismatch!"
+
     ddp_model = DDP(entropy_model, device_ids=[local_rank], find_unused_parameters=False)
 
     optimizer = AdamW(
