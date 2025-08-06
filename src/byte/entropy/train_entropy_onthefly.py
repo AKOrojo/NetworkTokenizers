@@ -59,13 +59,19 @@ def create_entropy_model(tokenizer: TokenPCAPByteTokenizer) -> (LMTransformer, L
     effective_vocab_size = len(tokenizer.get_vocab())
 
     model_args = LMTransformerArgs(
-        dim=512,
-        n_layers=3,
-        n_heads=8,
+        dim=768,
+        n_layers=14,
+        n_heads=12,
         vocab_size=effective_vocab_size,
-        max_seqlen=2048,
-        sliding_window=1024,
-        attn_impl="xformers"
+        max_seqlen=8192,
+        ffn_dim_multiplier=1.0,
+        sliding_window=512,
+        attn_bias_type="local_block_causal",
+        attn_impl="xformers",
+        norm_eps=1e-5,
+        rope_theta=10000.0,
+        init_base_std=None,
+        init_std_factor="current_depth"
     )
 
     if dist.get_rank() == 0:
