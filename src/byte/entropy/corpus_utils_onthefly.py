@@ -1,32 +1,34 @@
 import os
+import random
 import sys
 from itertools import cycle
 from pathlib import Path
-import random
 from typing import List
 
-from datasets import load_dataset
+import torch
 import torch.distributed as dist
 from torch.utils.data import IterableDataset
-import torch
 
-# Assuming TokenPCAPByteTokenizer is in this path
 from src.byte.raw.token_pcap_byte_tokenizer import TokenPCAPByteTokenizer
 
 
 class StreamingCorpusDataset(IterableDataset):
     """
-    An IterableDataset that streams raw data from PCAP files and/or the DCLM dataset.
-    It's designed for multi-process data loading in a distributed setting.
+    An IterableDataset that streams raw data from PCAP files.
     """
 
-    def __init__(self, pcap_dir: str, pcap_ratio: float = 0.5):
+    def __init__(self, pcap_dir: str):
         super().__init__()
         self.pcap_dir = pcap_dir
-        self.pcap_ratio = pcap_ratio
 
         if self.pcap_dir:
-            print("Scanning for pcap files...")
+            if dist.is_available() and dist.is_initialized():
+                rank = dist.get_rank()
+                if rank == 0:
+                    print("Scanning for pcap files...")
+            else:
+                print("Scanning for pcap files...")
+
             all_pcap_files = sorted(
                 list(Path(self.pcap_dir).glob("**/*.pcap")) + list(Path(self.pcap_dir).glob("**/*.pcapng")))
 
@@ -40,7 +42,6 @@ class StreamingCorpusDataset(IterableDataset):
                 if os.path.getsize(f) < size_limit_bytes
             ]
 
-            # --- START: DISTRIBUTED SAMPLING FIX ---
             # Shard the dataset for each distributed process
             if dist.is_available() and dist.is_initialized():
                 rank = dist.get_rank()
@@ -54,7 +55,6 @@ class StreamingCorpusDataset(IterableDataset):
                     f"Files for this rank: {len(files_for_rank)}"
                 )
                 self.pcap_files = files_for_rank
-            # --- END: DISTRIBUTED SAMPLING FIX ---
 
         else:
             self.pcap_files = []
@@ -66,16 +66,6 @@ class StreamingCorpusDataset(IterableDataset):
         random.shuffle(worker_files)
         return cycle(worker_files)
 
-    @staticmethod
-    def _init_text_iterator():
-        """Initializes the iterator for the text dataset."""
-        # `datasets` handles DDP sharding automatically when streaming
-        text_stream = load_dataset(
-            "mlfoundations/dclm-baseline-1.0",
-            streaming=True,
-            split="train"
-        ).shuffle(seed=42, buffer_size=10_000)
-        return iter(text_stream)
 
     def __iter__(self):
         """The core logic that yields one raw data sample at a time."""
@@ -90,24 +80,14 @@ class StreamingCorpusDataset(IterableDataset):
 
         random.seed(seed)
 
-        pcap_iterator = None
-        if self.pcap_ratio > 0.0 and self.pcap_files:
-            pcap_iterator = self._init_pcap_iterator()
-
-        text_iterator = None
-        if self.pcap_ratio < 1.0:
-            text_iterator = self._init_text_iterator()
+        pcap_iterator = self._init_pcap_iterator()
 
         while True:
-            use_pcap_source = pcap_iterator is not None and random.random() < self.pcap_ratio
+            use_pcap_source = pcap_iterator is not None
 
             try:
                 if use_pcap_source:
                     yield {"type": "pcap", "data": next(pcap_iterator)}
-                elif text_iterator is not None:
-                    # The huggingface datasets library handles DDP for the text stream
-                    sample = next(text_iterator)
-                    yield {"type": "text", "data": sample["text"]}
                 else:
                     break
             except StopIteration:

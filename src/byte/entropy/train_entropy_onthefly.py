@@ -235,7 +235,6 @@ if __name__ == "__main__":
         # --- User-Specific Paths ---
         "pcap_directory": "/home/abanisenioluwa_oroj1/Downloads/flows",
         "checkpoint_dir": "checkpoints",
-        "pcap_data_ratio": 1.0,
         "training_steps": 9375,
         "learning_rate": 4e-4,
         "warmup_steps": 500,
@@ -282,7 +281,6 @@ if __name__ == "__main__":
     # 1. Instantiate your custom dataset
     streaming_dataset = StreamingCorpusDataset(
         pcap_dir=train_config['pcap_directory'],
-        pcap_ratio=train_config['pcap_data_ratio']
     )
 
     # 2. Instantiate your custom collate function
