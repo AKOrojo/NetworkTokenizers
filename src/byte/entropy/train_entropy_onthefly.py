@@ -12,7 +12,10 @@ sys.path.insert(0, str(project_root))
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
+from itertools import islice
+from typing import List
 from datetime import datetime
+import time
 import wandb
 from tqdm import tqdm
 
@@ -181,7 +184,7 @@ def train_entropy_model(
         scheduler: LambdaLR,
         tokenizer: TokenPCAPByteTokenizer
 ):
-    """Training loop optimized for on-the-fly tokenization and H200."""
+    """Training loop optimized for on-the-fly tokenization and 2x A5000 32GB."""
     device = torch.device(f"cuda:{local_rank}")
     model.train()
     scaler = GradScaler()
@@ -250,6 +253,15 @@ def train_entropy_model(
 
             scheduler.step()
             optimizer.zero_grad(set_to_none=True)
+
+            # More aggressive memory cleanup to prevent CUDA corruption
+            if (step + 1) % 50 == 0:  # Every 50 steps instead of 100
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
+                # Additional cleanup for multi-GPU
+                if world_size > 1:
+                    dist.barrier()  # Synchronize all processes
 
             step_time = time.time() - step_start_time
 
@@ -356,7 +368,19 @@ def train_entropy_model(
 
         except Exception as e:
             if rank == 0:
-                print(f"Error at step {step}: {e}. Skipping.")
+                print(f"Error at step {step}: {e}")
+
+                # Check if it's a CUDA error
+                if "CUDA" in str(e):
+                    print("CUDA error detected. Attempting recovery...")
+                    try:
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                        print("CUDA cache cleared. Continuing training...")
+                    except:
+                        print("CUDA recovery failed. Skipping step.")
+                else:
+                    print("Skipping step.")
             continue
 
     if rank == 0:
@@ -370,33 +394,33 @@ if __name__ == "__main__":
     # Initialize distributed training (even for single GPU)
     rank, world_size, local_rank = setup_distributed()
 
-    # OPTIMIZED CONFIG FOR ON-THE-FLY TOKENIZATION
+    # CONSERVATIVE CONFIG FOR 2x A5000 32GB - STABILITY FOCUSED
     train_config = {
         # Data paths
-        "raw_data_dir": "/data/orojoa/raw_pcaps",  # Directory with raw PCAP files
+        "raw_data_dir": "/home/abanisenioluwa_oroj1/Downloads/flows",  # Updated path
 
         # Tokenization settings
         "chunk_size": 8192,  # Size of chunks to create from files (bytes)
         "cache_tokenized": True,  # Cache tokenized chunks in memory
-        "cache_size": 2000,  # Maximum chunks to cache
+        "cache_size": 1200,  # Very conservative for stability
 
-        # Training hyperparameters (BLT-style data efficiency)
+        # Training hyperparameters - CONSERVATIVE FOR STABILITY
         "training_steps": 5000,
         "learning_rate": 2e-4,  # BLT's proven LR
         "warmup_steps": 100,  # BLT's warmup
-        "batch_size_per_gpu": 3,  # Reduced due to tokenization overhead
-        "gradient_accumulation_steps": 53,  # Adjusted to maintain similar effective batch size
+        "batch_size_per_gpu": 3,  # Reduced back to conservative
+        "gradient_accumulation_steps": 27,  # 3 * 27 * 8192 * 2 = 1,327,104 tokens (~1.33M)
         "max_seqlen": 8192,
         "gradient_clip_norm": 10.0,  # BLT's setting
-        "eval_freq": 250,  # Evaluate every 250 steps
+        "eval_freq": 500,  # Less frequent evaluation
 
         # Checkpointing
         "checkpoint_freq": 250,  # Every 250 steps
         "checkpoint_dir": "checkpoints_onthefly",
 
-        # Performance settings
-        "num_workers": 2,  # Reduced workers due to tokenization in main process
-        "prefetch_factor": 4,  # Reduced prefetch
+        # Performance settings - VERY CONSERVATIVE
+        "num_workers": 1,  # Minimal workers to reduce complexity
+        "prefetch_factor": 1,  # Minimal prefetch
     }
 
     # Calculate effective batch size in tokens
@@ -408,7 +432,7 @@ if __name__ == "__main__":
     )
 
     if rank == 0:
-        print(f"Training Configuration (On-The-Fly Tokenization):")
+        print(f"Training Configuration (2x A5000 32GB - Conservative/Stable):")
         print(f"  Raw data directory: {train_config['raw_data_dir']}")
         print(f"  Chunk size: {train_config['chunk_size']} bytes")
         print(f"  Tokenization cache: {train_config['cache_tokenized']} (max {train_config['cache_size']} chunks)")
@@ -423,9 +447,30 @@ if __name__ == "__main__":
         print(
             f"  Effective batch size: {train_config['effective_batch_tokens']:,} tokens ({train_config['effective_batch_tokens'] / 1e6:.2f}M)")
         print(f"  Max sequence length: {train_config['max_seqlen']}")
-        print(f"  Model: 768d, 14L, 12H (~130M params)")
+        print(f"  Model: 768d, 14L, 12H (~100M params)")
         print(f"  Total tokens: {train_config['training_steps'] * train_config['effective_batch_tokens'] / 1e9:.1f}B")
         print(f"  World size: {world_size}")
+        print(f"  Hardware: 2x A5000 32GB (CONSERVATIVE CONFIG for stability)")
+        print(f"  Memory utilization: ~60-70% per GPU (reduced for stability)")
+
+        # Hardware diagnostics
+        print(f"\n=== GPU Hardware Check ===")
+        for i in range(torch.cuda.device_count()):
+            props = torch.cuda.get_device_properties(i)
+            print(f"  GPU {i}: {props.name}")
+            print(f"    Memory: {props.total_memory // 1024 ** 3} GB")
+            print(f"    SM: {props.major}.{props.minor}")
+            print(f"    Multiprocessors: {props.multi_processor_count}")
+
+            # Test GPU memory allocation
+            try:
+                test_tensor = torch.randn(1000, 1000, device=f'cuda:{i}')
+                del test_tensor
+                torch.cuda.empty_cache()
+                print(f"    Status: ✅ OK")
+            except Exception as e:
+                print(f"    Status: ❌ ERROR - {e}")
+        print(f"=== End GPU Check ===\n")
 
         Path(train_config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
 
@@ -434,9 +479,9 @@ if __name__ == "__main__":
     if rank == 0:
         print(f"Tokenizer initialized: vocab_size={tokenizer.vocab_size}, pad_token_id={tokenizer.pad_token_id}")
 
-    # Create model
+    # Create model (WITHOUT torch.compile for A5000 compatibility)
     entropy_model, model_args = create_entropy_model(tokenizer, rank)
-    entropy_model = torch.compile(entropy_model)
+    # entropy_model = torch.compile(entropy_model)  # DISABLED: Causes issues with xformers on A5000
     entropy_model.to(local_rank)
     ddp_model = DDP(entropy_model, device_ids=[local_rank], find_unused_parameters=False)
 
@@ -499,8 +544,8 @@ if __name__ == "__main__":
 
     # Initialize wandb
     if rank == 0:
-        project_name = "pcap_entropy_model_onthefly"
-        run_name = f"h200-onthefly-{train_config['effective_batch_tokens'] // 1000}k-tokens-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        project_name = "pcap_entropy_model_2xa5000_onthefly"
+        run_name = f"2xa5000-onthefly-{train_config['effective_batch_tokens'] // 1000}k-tokens-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
 
         wandb_config = train_config.copy()
         wandb_config["model_args"] = model_args.model_dump()
@@ -518,7 +563,11 @@ if __name__ == "__main__":
 
     # Start training
     if rank == 0:
-        print("Starting training with on-the-fly tokenization...")
+        print("Starting training with on-the-fly tokenization on 2x A5000 32GB...")
+        print("NOTE: torch.compile disabled for xformers compatibility")
+        print("CONSERVATIVE configuration for maximum stability")
+        print("If CUDA errors persist, consider single GPU fallback (see debug guide)")
+        print("=" * 60)
 
     train_entropy_model(
         model=ddp_model,
@@ -533,18 +582,50 @@ if __name__ == "__main__":
         tokenizer=tokenizer
     )
 
-    # Save final model
+    # Save final model with proper error handling and memory cleanup
     if rank == 0:
-        final_model_path = "pcap_entropy_model_onthefly_final.pt"
-        torch.save({
-            'model_state_dict': ddp_model.module.state_dict(),
-            'model_args': model_args.model_dump(),
-            'tokenizer_config': {
-                'vocab_size': tokenizer.vocab_size,
-                'pad_token_id': tokenizer.pad_token_id
-            }
-        }, final_model_path)
-        print(f"Final model saved to {final_model_path}")
+        final_model_path = "pcap_entropy_model_2xa5000_onthefly_final.pt"
+
+        try:
+            print("Synchronizing CUDA and clearing cache before saving...")
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+            # Move model to CPU to avoid CUDA corruption during save
+            print("Moving model to CPU for safe saving...")
+            cpu_model_state = {}
+            for key, value in ddp_model.module.state_dict().items():
+                cpu_model_state[key] = value.cpu()
+
+            print("Saving final model...")
+            torch.save({
+                'model_state_dict': cpu_model_state,
+                'model_args': model_args.model_dump(),
+                'tokenizer_config': {
+                    'vocab_size': tokenizer.vocab_size,
+                    'pad_token_id': tokenizer.pad_token_id
+                },
+                'training_completed': True,
+                'final_step': train_config['training_steps']
+            }, final_model_path)
+
+            print(f"Final model saved successfully to {final_model_path}")
+
+        except Exception as e:
+            print(f"Error saving final model: {e}")
+            print("Attempting alternative save method...")
+
+            try:
+                # Alternative: save just the state dict
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                alternative_path = "pcap_entropy_model_2xa5000_statedict_only.pt"
+                torch.save(ddp_model.module.cpu().state_dict(), alternative_path)
+                print(f"Alternative save successful: {alternative_path}")
+            except Exception as e2:
+                print(f"Alternative save also failed: {e2}")
+                print("Model training completed but final save failed. Check checkpoints directory for saved models.")
+
         wandb.finish()
 
     cleanup_distributed()
