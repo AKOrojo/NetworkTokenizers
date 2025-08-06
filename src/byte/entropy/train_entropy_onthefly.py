@@ -206,8 +206,8 @@ if __name__ == "__main__":
         "learning_rate": 4e-4,
         "warmup_steps": 500,
         "sequence_length": 8192,
-        "batch_size_per_gpu": 64,
-        "gradient_accumulation_steps": 4,
+        "batch_size_per_gpu": 8,
+        "gradient_accumulation_steps": 128,
         "checkpoint_freq": 500
     }
 
