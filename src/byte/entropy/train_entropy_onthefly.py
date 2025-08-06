@@ -251,7 +251,7 @@ if __name__ == "__main__":
     pcap_tokenizer = TokenPCAPByteTokenizer()
 
     entropy_model, model_args = create_entropy_model(pcap_tokenizer)
-    entropy_model = torch.compile(entropy_model)
+    #entropy_model = torch.compile(entropy_model)
     entropy_model.to(local_rank)
     ddp_model = DDP(entropy_model, device_ids=[local_rank], find_unused_parameters=False)
 
