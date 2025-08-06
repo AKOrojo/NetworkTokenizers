@@ -2,18 +2,16 @@
 Dataset classes for loading raw PCAP data and tokenizing on-the-fly.
 """
 
-import json
 import random
-import os
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
-import torch
-import numpy as np
-from torch.utils.data import Dataset, IterableDataset
-from concurrent.futures import ThreadPoolExecutor
 import threading
-from queue import Queue, Empty
 import time
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from queue import Queue, Empty
+from typing import List, Dict, Any, Optional
+
+import torch
+from torch.utils.data import Dataset, IterableDataset
 
 
 class RawPCAPDataset(Dataset):

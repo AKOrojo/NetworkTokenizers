@@ -5,28 +5,18 @@ from pathlib import Path
 
 from torch.utils.data import DataLoader
 
-# --- Add project root to the Python path ---
 project_root = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(project_root))
 
 import torch
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
-from itertools import islice
-from typing import List
 from datetime import datetime
-import time
 import wandb
 from tqdm import tqdm
-
-# --- Imports for DDP ---
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
-# --- Import for Mixed Precision ---
 from torch.amp import GradScaler, autocast
-
-# --- UPDATED IMPORTS FOR ON-THE-FLY TOKENIZATION ---
 from corpus_utils_onthefly import RawPCAPDataset, OnTheFlyCollate, create_dataloader_from_raw
 from src.byte.raw.token_pcap_byte_tokenizer import TokenPCAPByteTokenizer
 from src.byte.entropy.transformer import LMTransformer, LMTransformerArgs
@@ -200,10 +190,6 @@ def train_entropy_model(
         initial=start_step
     )
 
-    # Track tokenization performance
-    tokenization_times = []
-    batch_load_times = []
-
     for step in progress_bar:
         try:
             accumulated_loss = 0.0
@@ -212,11 +198,7 @@ def train_entropy_model(
             # Gradient accumulation loop
             for micro_step in range(config['gradient_accumulation_steps']):
                 try:
-                    # Get batch with on-the-fly tokenization
-                    batch_start_time = time.time()
                     batch = next(data_iterator)
-                    batch_load_time = time.time() - batch_start_time
-                    batch_load_times.append(batch_load_time)
 
                 except StopIteration:
                     # DataLoader exhausted, reset it
@@ -269,10 +251,6 @@ def train_entropy_model(
             if rank == 0:
                 current_lr = scheduler.get_last_lr()[0]
 
-                # Calculate performance metrics
-                avg_batch_load_time = sum(batch_load_times[-config['gradient_accumulation_steps']:]) / config[
-                    'gradient_accumulation_steps']
-
                 # Log training metrics
                 wandb.log({
                     "train_loss": accumulated_loss,
@@ -280,15 +258,12 @@ def train_entropy_model(
                     "step": step,
                     "tokens_processed": (step + 1) * config['effective_batch_tokens'],
                     "step_time": step_time,
-                    "avg_batch_load_time": avg_batch_load_time,
-                    "tokenization_overhead": avg_batch_load_time / step_time if step_time > 0 else 0
                 })
 
                 progress_bar.set_postfix(
                     loss=f"{accumulated_loss:.4f}",
                     lr=f"{current_lr:.2e}",
                     tokens=f"{(step + 1) * config['effective_batch_tokens'] / 1e6:.1f}M",
-                    load_time=f"{avg_batch_load_time:.3f}s"
                 )
 
                 # Evaluation every eval_freq steps
@@ -385,7 +360,6 @@ def train_entropy_model(
 
     if rank == 0:
         print("Training finished.")
-        print(f"Average batch load time: {sum(batch_load_times) / len(batch_load_times):.3f}s")
 
 
 if __name__ == "__main__":
@@ -406,21 +380,21 @@ if __name__ == "__main__":
 
         # Training hyperparameters - CONSERVATIVE FOR STABILITY
         "training_steps": 5000,
-        "learning_rate": 2e-4,  # BLT's proven LR
-        "warmup_steps": 100,  # BLT's warmup
-        "batch_size_per_gpu": 3,  # Reduced back to conservative
+        "learning_rate": 2e-4,
+        "warmup_steps": 100,
+        "batch_size_per_gpu": 3,
         "gradient_accumulation_steps": 27,  # 3 * 27 * 8192 * 2 = 1,327,104 tokens (~1.33M)
         "max_seqlen": 8192,
-        "gradient_clip_norm": 10.0,  # BLT's setting
-        "eval_freq": 500,  # Less frequent evaluation
+        "gradient_clip_norm": 10.0,
+        "eval_freq": 500,
 
         # Checkpointing
-        "checkpoint_freq": 250,  # Every 250 steps
-        "checkpoint_dir": "checkpoints_onthefly",
+        "checkpoint_freq": 250,
+        "checkpoint_dir": "checkpoints",
 
-        # Performance settings - VERY CONSERVATIVE
-        "num_workers": 1,  # Minimal workers to reduce complexity
-        "prefetch_factor": 1,  # Minimal prefetch
+        # Performance settings
+        "num_workers": 2,
+        "prefetch_factor": 1,
     }
 
     # Calculate effective batch size in tokens
@@ -450,27 +424,6 @@ if __name__ == "__main__":
         print(f"  Model: 768d, 14L, 12H (~100M params)")
         print(f"  Total tokens: {train_config['training_steps'] * train_config['effective_batch_tokens'] / 1e9:.1f}B")
         print(f"  World size: {world_size}")
-        print(f"  Hardware: 2x A5000 32GB (CONSERVATIVE CONFIG for stability)")
-        print(f"  Memory utilization: ~60-70% per GPU (reduced for stability)")
-
-        # Hardware diagnostics
-        print(f"\n=== GPU Hardware Check ===")
-        for i in range(torch.cuda.device_count()):
-            props = torch.cuda.get_device_properties(i)
-            print(f"  GPU {i}: {props.name}")
-            print(f"    Memory: {props.total_memory // 1024 ** 3} GB")
-            print(f"    SM: {props.major}.{props.minor}")
-            print(f"    Multiprocessors: {props.multi_processor_count}")
-
-            # Test GPU memory allocation
-            try:
-                test_tensor = torch.randn(1000, 1000, device=f'cuda:{i}')
-                del test_tensor
-                torch.cuda.empty_cache()
-                print(f"    Status: ✅ OK")
-            except Exception as e:
-                print(f"    Status: ❌ ERROR - {e}")
-        print(f"=== End GPU Check ===\n")
 
         Path(train_config['checkpoint_dir']).mkdir(parents=True, exist_ok=True)
 
@@ -479,7 +432,7 @@ if __name__ == "__main__":
     if rank == 0:
         print(f"Tokenizer initialized: vocab_size={tokenizer.vocab_size}, pad_token_id={tokenizer.pad_token_id}")
 
-    # Create model (WITHOUT torch.compile for A5000 compatibility)
+    # Create model
     entropy_model, model_args = create_entropy_model(tokenizer, rank)
     # entropy_model = torch.compile(entropy_model)  # DISABLED: Causes issues with xformers on A5000
     entropy_model.to(local_rank)
@@ -502,7 +455,6 @@ if __name__ == "__main__":
         min_ratio=0.1
     )
 
-    # --- ON-THE-FLY TOKENIZATION PIPELINE ---
     if rank == 0:
         print("Setting up on-the-fly tokenization pipeline...")
 
@@ -563,11 +515,7 @@ if __name__ == "__main__":
 
     # Start training
     if rank == 0:
-        print("Starting training with on-the-fly tokenization on 2x A5000 32GB...")
-        print("NOTE: torch.compile disabled for xformers compatibility")
-        print("CONSERVATIVE configuration for maximum stability")
-        print("If CUDA errors persist, consider single GPU fallback (see debug guide)")
-        print("=" * 60)
+        print("Starting training with on-the-fly tokenization")
 
     train_entropy_model(
         model=ddp_model,
@@ -584,47 +532,21 @@ if __name__ == "__main__":
 
     # Save final model with proper error handling and memory cleanup
     if rank == 0:
-        final_model_path = "pcap_entropy_model_2xa5000_onthefly_final.pt"
+        final_model_path = "pcap_entropy_model_final.pt"
 
-        try:
-            print("Synchronizing CUDA and clearing cache before saving...")
-            torch.cuda.synchronize()
-            torch.cuda.empty_cache()
+        print("Saving final model...")
+        torch.save({
+            'model_state_dict': ddp_model.module.state_dict(),
+            'model_args': model_args.model_dump(),
+            'tokenizer_config': {
+                'vocab_size': tokenizer.vocab_size,
+                'pad_token_id': tokenizer.pad_token_id
+            },
+            'training_completed': True,
+            'final_step': train_config['training_steps']
+        }, final_model_path)
 
-            # Move model to CPU to avoid CUDA corruption during save
-            print("Moving model to CPU for safe saving...")
-            cpu_model_state = {}
-            for key, value in ddp_model.module.state_dict().items():
-                cpu_model_state[key] = value.cpu()
-
-            print("Saving final model...")
-            torch.save({
-                'model_state_dict': cpu_model_state,
-                'model_args': model_args.model_dump(),
-                'tokenizer_config': {
-                    'vocab_size': tokenizer.vocab_size,
-                    'pad_token_id': tokenizer.pad_token_id
-                },
-                'training_completed': True,
-                'final_step': train_config['training_steps']
-            }, final_model_path)
-
-            print(f"Final model saved successfully to {final_model_path}")
-
-        except Exception as e:
-            print(f"Error saving final model: {e}")
-            print("Attempting alternative save method...")
-
-            try:
-                # Alternative: save just the state dict
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                alternative_path = "pcap_entropy_model_2xa5000_statedict_only.pt"
-                torch.save(ddp_model.module.cpu().state_dict(), alternative_path)
-                print(f"Alternative save successful: {alternative_path}")
-            except Exception as e2:
-                print(f"Alternative save also failed: {e2}")
-                print("Model training completed but final save failed. Check checkpoints directory for saved models.")
+        print(f"Final model saved successfully to {final_model_path}")
 
         wandb.finish()
 
