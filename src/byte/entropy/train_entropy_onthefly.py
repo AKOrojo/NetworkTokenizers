@@ -192,15 +192,17 @@ if __name__ == "__main__":
     rank, world_size, local_rank = setup_distributed()
 
     train_config = {
+        # --- User-Specific Paths ---
         "pcap_directory": "/home/abanisenioluwa_oroj1/Downloads/flows",
+        "checkpoint_dir": "checkpoints",
         "pcap_data_ratio": 1.0,
-        "training_steps": 100000,
+        "training_steps": 9375,
         "learning_rate": 4e-4,
         "warmup_steps": 500,
+        "sequence_length": 8192,
         "batch_size_per_gpu": 64,
-        "gradient_accumulation_steps": 12,
-        "checkpoint_freq": 500,
-        "checkpoint_dir": "checkpoints"
+        "gradient_accumulation_steps": 4,
+        "checkpoint_freq": 500
     }
 
     if rank == 0:
