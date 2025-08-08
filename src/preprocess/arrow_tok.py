@@ -28,13 +28,14 @@ def process_chunk(
         tokenizer: TokenPCAPByteTokenizer,
         output_dir: Path,
         worker_id: int,
+        delete_originals: bool = False,
 ):
     """
     Processes a chunk of PCAP files.
     - Tokenizes each file.
     - Buffers tokens in memory.
     - Writes buffered tokens to Arrow files once a threshold is met.
-    - Deletes original PCAP files after successful processing.
+    - Optionally deletes original PCAP files after successful processing.
     """
     token_buffer = []
     tokens_in_buffer = 0
@@ -72,15 +73,17 @@ def process_chunk(
 
     pbar.close()
 
-    # After the entire chunk is processed and written, delete the source files
-    print(f"Worker {worker_id}: Deleting {len(pcap_files)} source PCAP files...")
-    for pcap_file in pcap_files:
-        try:
-            os.remove(pcap_file)
-        except OSError as e:
-            print(f"Worker {worker_id}: Failed to delete {pcap_file}: {e}")
-
-    print(f"Worker {worker_id}: Finished chunk processing and deletion.")
+    # Only delete source files if explicitly requested
+    if delete_originals:
+        print(f"Worker {worker_id}: Deleting {len(pcap_files)} source PCAP files...")
+        for pcap_file in pcap_files:
+            try:
+                os.remove(pcap_file)
+            except OSError as e:
+                print(f"Worker {worker_id}: Failed to delete {pcap_file}: {e}")
+        print(f"Worker {worker_id}: Finished chunk processing and deletion.")
+    else:
+        print(f"Worker {worker_id}: Finished chunk processing (original files preserved).")
 
 
 def write_arrow_file(token_buffer: List[List[int]], output_dir: Path, worker_id: int, file_index: int):
@@ -103,8 +106,8 @@ def write_arrow_file(token_buffer: List[List[int]], output_dir: Path, worker_id:
         # 3. Create the Arrow Array from the filtered buffer.
         token_array = pa.array(filtered_buffer, type=schema.field('tokens').type)
 
-        # 4. Create a RecordBatch directly from the array and schema.
-        batch = pa.RecordBatch.from_arrays(list_arrays=[token_array], schema=schema)
+        # 4. Create a Table directly from the array and schema.
+        table = pa.table([token_array], schema=schema)
 
         # --- END: ROBUSTNESS FIX ---
 
@@ -112,8 +115,8 @@ def write_arrow_file(token_buffer: List[List[int]], output_dir: Path, worker_id:
         output_filename = output_dir / f"worker_{worker_id}_part_{file_index:04d}.arrow"
 
         # Write the file with ZSTD compression for a good balance of speed and size
-        with pa.ipc.new_file(output_filename, batch.schema, options=pa.ipc.IpcWriteOptions(compression="zstd")) as writer:
-            writer.write_table(batch)
+        with pa.ipc.new_file(output_filename, table.schema, options=pa.ipc.IpcWriteOptions(compression="zstd")) as writer:
+            writer.write_table(table)
 
         tqdm.write(f"Worker {worker_id}: Wrote {len(token_buffer)} sequences to {output_filename}")
 
@@ -124,7 +127,7 @@ def write_arrow_file(token_buffer: List[List[int]], output_dir: Path, worker_id:
 def main():
     """Main function to drive the preprocessing."""
     parser = argparse.ArgumentParser(
-        description="Tokenize PCAP files and save to Arrow format, deleting originals."
+        description="Tokenize PCAP files and save to Arrow format, with option to delete originals."
     )
     parser.add_argument(
         "pcap_dir", type=str, help="Directory containing the source PCAP files."
@@ -138,6 +141,11 @@ def main():
         default=os.cpu_count(),
         help="Number of parallel worker processes to use.",
     )
+    parser.add_argument(
+        "--delete-originals",
+        action="store_true",
+        help="Delete original PCAP files after successful processing. DEFAULT: Keep original files.",
+    )
     args = parser.parse_args()
 
     pcap_dir = Path(args.pcap_dir)
@@ -147,6 +155,12 @@ def main():
     if not pcap_dir.is_dir():
         print(f"Error: PCAP directory not found at {pcap_dir}")
         return
+
+    # Show deletion behavior to user
+    if args.delete_originals:
+        print("⚠️  WARNING: Original PCAP files will be DELETED after processing!")
+    else:
+        print("✅ Original PCAP files will be preserved.")
 
     # 1. Discover all files first
     all_files = get_pcap_files(pcap_dir)
@@ -167,9 +181,9 @@ def main():
     # 4. Process chunks in parallel
     start_time = time.time()
 
-    # Prepare arguments for each worker
+    # Prepare arguments for each worker (now includes delete_originals flag)
     worker_args = [
-        (chunks[i], tokenizer, output_dir, i) for i in range(len(chunks))
+        (chunks[i], tokenizer, output_dir, i, args.delete_originals) for i in range(len(chunks))
     ]
 
     # Use a multiprocessing pool
@@ -182,6 +196,10 @@ def main():
     print("Preprocessing complete!")
     print(f"Total time taken: {end_time - start_time:.2f} seconds")
     print(f"Tokenized data is available in: {output_dir}")
+    if args.delete_originals:
+        print("Original PCAP files have been deleted.")
+    else:
+        print("Original PCAP files have been preserved.")
     print("=" * 50)
 
 
