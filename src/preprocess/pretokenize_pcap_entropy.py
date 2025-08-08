@@ -3,19 +3,19 @@
 Pre-tokenize PCAP files into chunks for efficient training.
 """
 
-import os
-import json
-import pickle
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
 import argparse
-from tqdm import tqdm
-import torch
-import numpy as np
+import json
 import multiprocessing as mp
-from multiprocessing import Pool, Manager, Value, Lock
+import pickle
 import time
 import traceback
+from multiprocessing import Pool
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+import torch
+from tqdm import tqdm
 
 from src.byte.raw.token_pcap_byte_tokenizer import TokenPCAPByteTokenizer
 
